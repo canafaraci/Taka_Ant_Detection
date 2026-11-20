@@ -1,0 +1,28 @@
+{
+  "note": "Zones for track-ants, saved by the ant app for pilot video 4h-.mp4 / Pilot video 16h-.mp4.",
+  "feeders": [
+    {
+      "id": "feeder_left",
+      "cx": 815,
+      "cy": 1590,
+      "cup_radius": 95,
+      "hide_radius": 120,
+      "exit_radius": 155
+    },
+    {
+      "id": "feeder_right",
+      "cx": 2724,
+      "cy": 1594,
+      "cup_radius": 95,
+      "hide_radius": 120,
+      "exit_radius": 155
+    }
+  ],
+  "nest": {
+    "cx": 1827,
+    "cy": 528,
+    "enter_radius": 70,
+    "birth_radius": 90,
+    "note": "Nest = the opening. Ants lost within enter_radius go in; new ants appear only within birth_radius."
+  }
+}

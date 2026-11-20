@@ -1,0 +1,17 @@
+{
+  "zone_version": 1,
+  "video": "10fps sample for aloha.mp4",
+  "frame_width": 3840,
+  "frame_height": 2160,
+  "zones": [
+    {
+      "id": "nest_opening_clearance",
+      "type": "circle",
+      "cx": 1790,
+      "cy": 442,
+      "r": 50,
+      "rule": "Ignore any ant or detection whose box centre is inside this circle. Ants are counted only once they have left the clump at the nest opening (decided by Can, 2026-10-11).",
+      "how_chosen": "Clump centre from the model's detections on 10 test tiles (x 1777-1805, y 418-440); the clump fits within about 30 px; 50 px adds clearance of about 2 ant lengths."
+    }
+  ]
+}

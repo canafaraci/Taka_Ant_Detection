@@ -19,6 +19,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", required=True, help="Annotation project JSON path.")
     parser.add_argument("--canvas-max-width", type=int, default=1100)
     parser.add_argument("--canvas-max-height", type=int, default=800)
+    parser.add_argument(
+        "--max-zoom",
+        type=float,
+        default=1.0,
+        help="Largest display magnification for small images (default 1.0 = never enlarge).",
+    )
+    parser.add_argument("--start", type=int, default=1, help="Image number to open first (1-based).")
     return parser
 
 
@@ -31,6 +38,8 @@ class AnnotationApp:
         project_path: Path,
         canvas_max_width: int,
         canvas_max_height: int,
+        max_zoom: float = 1.0,
+        start: int = 1,
     ) -> None:
         self.root = root
         self.images_dir = images_dir
@@ -38,8 +47,9 @@ class AnnotationApp:
         self.project_path = project_path
         self.canvas_max_width = canvas_max_width
         self.canvas_max_height = canvas_max_height
+        self.max_zoom = max(0.1, float(max_zoom))
         self.project = self.load_or_create_project()
-        self.index = 0
+        self.index = min(max(int(start), 1), len(self.project["images"])) - 1
         self.scale = 1.0
         self.display_width = 1
         self.display_height = 1
@@ -198,7 +208,7 @@ class AnnotationApp:
         self.scale = min(
             self.canvas_max_width / max(width, 1),
             self.canvas_max_height / max(height, 1),
-            1.0,
+            self.max_zoom,
         )
         self.display_width = max(1, int(round(width * self.scale)))
         self.display_height = max(1, int(round(height * self.scale)))
@@ -416,6 +426,8 @@ def main() -> None:
         project_path=Path(args.project),
         canvas_max_width=args.canvas_max_width,
         canvas_max_height=args.canvas_max_height,
+        max_zoom=args.max_zoom,
+        start=args.start,
     )
     root.mainloop()
 

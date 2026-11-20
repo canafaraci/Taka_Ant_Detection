@@ -1,0 +1,30 @@
+{
+  "areas_version": 1,
+  "note": "Area labels (full-frame px); saved by the ant app.",
+  "areas": [
+    {
+      "id": "feeder_left",
+      "type": "rect",
+      "x": 625,
+      "y": 1415,
+      "w": 380,
+      "h": 350
+    },
+    {
+      "id": "feeder_right",
+      "type": "rect",
+      "x": 2534,
+      "y": 1419,
+      "w": 380,
+      "h": 350
+    },
+    {
+      "id": "nest_entrance",
+      "type": "rect",
+      "x": 1632,
+      "y": 488,
+      "w": 390,
+      "h": 130
+    }
+  ]
+}

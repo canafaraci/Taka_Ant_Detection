@@ -1,0 +1,9 @@
+{
+ "note": "P(real ant | detector score) on held-out test set v1, model ours_v2_best, centre rule 12 px, nest zone ignored (2026-10-30). Few low-score detections, so low bins are rough.",
+ "bins": [
+  {"lo": 0.0,  "hi": 0.7,  "n": 8,   "p_ant": 0.50},
+  {"lo": 0.7,  "hi": 0.9,  "n": 11,  "p_ant": 0.73},
+  {"lo": 0.9,  "hi": 0.98, "n": 21,  "p_ant": 0.90},
+  {"lo": 0.98, "hi": 1.01, "n": 177, "p_ant": 0.977}
+ ]
+}

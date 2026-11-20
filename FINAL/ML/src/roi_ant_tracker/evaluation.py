@@ -197,6 +197,20 @@ def evaluate_detector(
         "end_to_end_images_per_second": len(dataset) / evaluation_seconds,
     }
     write_image_metrics(output / "per_image_metrics.csv", image_rows)
+    (output / "predictions.json").write_text(
+        json.dumps(
+            [
+                {
+                    "image_id": prediction.image_id,
+                    "file_name": metadata_by_id[prediction.image_id]["file_name"],
+                    "score": round(prediction.score, 4),
+                    "box_xyxy": [round(value, 1) for value in prediction.box],
+                }
+                for prediction in predictions
+            ]
+        ),
+        encoding="utf-8",
+    )
     (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(
         f"[evaluate] precision={overall['precision']:.3f} recall={overall['recall']:.3f} "
@@ -210,6 +224,8 @@ def evaluate_detector(
 def synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def match_image(

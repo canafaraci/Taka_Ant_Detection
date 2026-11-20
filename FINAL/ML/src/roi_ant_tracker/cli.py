@@ -49,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--device", default="auto")
     train.add_argument("--workers", type=int, default=0)
+    train.add_argument("--val-images", help="Validation images folder (default: same as --images).")
+    train.add_argument("--val-annotations", help="Validation COCO JSON. When given, _best and the LR schedule follow validation AP.")
+    train.add_argument("--val-score-threshold", type=float, default=0.30)
 
     track = commands.add_parser("track", help="Detect ants only inside saved ROIs and export trajectories.")
     track.add_argument("--video", required=True)
@@ -162,6 +165,9 @@ def main() -> None:
             max_grad_norm=args.max_grad_norm,
             max_empty_fraction=args.max_empty_fraction,
             reset_training_history=args.reset_training_history,
+            val_images_dir=args.val_images,
+            val_annotations_path=args.val_annotations,
+            val_score_threshold=args.val_score_threshold,
         )
     elif args.command == "track":
         track_video(

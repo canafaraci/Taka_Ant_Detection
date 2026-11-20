@@ -8,6 +8,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import CocoBoxDataset, collate_detection_batch
+from .evaluation import (
+    PredictionRecord,
+    average_precision,
+    best_operating_point,
+    metrics_at_threshold,
+    rank_predictions_by_center,
+)
 from .model import build_detector, choose_device
 
 
@@ -34,7 +41,13 @@ def train_detector(
     max_grad_norm: float = 1.0,
     max_empty_fraction: float = 1.0,
     reset_training_history: bool = False,
+    val_images_dir: str | None = None,
+    val_annotations_path: str | None = None,
+    val_score_threshold: float = 0.30,
+    val_center_distance: float = 12.0,
 ) -> None:
+    """Train a detector. With a validation set, every epoch is scored on it (centre-distance AP)
+    and the _best checkpoint and learning-rate schedule follow validation AP instead of training loss."""
     if lr_patience < 1:
         raise ValueError("lr_patience must be at least 1.")
     if not 0.0 < lr_factor < 1.0:
@@ -63,6 +76,21 @@ def train_detector(
         num_workers=workers,
         collate_fn=collate_detection_batch,
     )
+
+    val_loader = None
+    if val_annotations_path:
+        val_dataset = CocoBoxDataset(val_images_dir or images_dir, val_annotations_path, training=False)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=workers,
+            collate_fn=collate_detection_batch,
+        )
+        print(
+            f"[train] validation images={len(val_dataset)} "
+            f"boxes={sum(len(value) for value in val_dataset.annotations.values())}"
+        )
 
     starting_epoch = 0
     if resume_checkpoint:
@@ -106,7 +134,7 @@ def train_detector(
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="min",
+        mode="max" if val_loader is not None else "min",
         factor=lr_factor,
         patience=lr_patience,
         threshold=plateau_delta,
@@ -120,6 +148,7 @@ def train_detector(
     log_path = output.with_name(output.stem + "_training_log.csv")
     history = checkpoint.get("training_history", []) if resume_checkpoint and not reset_training_history else []
     best_loss = min((float(row["mean_loss"]) for row in history), default=float("inf"))
+    best_val_ap = max((float(row["val_ap"]) for row in history if row.get("val_ap") not in (None, "")), default=-1.0)
     plateau_epochs = 0
     write_training_log(log_path, history)
     print(
@@ -167,13 +196,20 @@ def train_detector(
                 )
         mean_loss = running_loss / len(loader)
         previous_lr = current_lr(optimizer)
-        improved = mean_loss < best_loss * (1.0 - plateau_delta)
-        if improved:
-            best_loss = mean_loss
-            plateau_epochs = 0
+        val_metrics: dict[str, float] = {}
+        if val_loader is not None:
+            best_loss = min(best_loss, mean_loss)
+            val_metrics = run_validation(model, val_loader, device, val_score_threshold, val_center_distance)
+            improved = val_metrics["val_ap"] > best_val_ap + 1e-6
+            if improved:
+                best_val_ap = val_metrics["val_ap"]
+            scheduler.step(val_metrics["val_ap"])
         else:
-            plateau_epochs += 1
-        scheduler.step(mean_loss)
+            improved = mean_loss < best_loss * (1.0 - plateau_delta)
+            if improved:
+                best_loss = mean_loss
+            scheduler.step(mean_loss)
+        plateau_epochs = 0 if improved else plateau_epochs + 1
         new_lr = current_lr(optimizer)
         lr_changed = new_lr < previous_lr
         history.append(
@@ -185,6 +221,7 @@ def train_detector(
                 "plateau_epochs": plateau_epochs,
                 "lr_reduced": int(lr_changed),
                 "seconds": time.time() - started,
+                **{key: round(value, 6) for key, value in val_metrics.items()},
             }
         )
         write_training_log(log_path, history)
@@ -209,6 +246,11 @@ def train_detector(
         status = "improved" if improved else f"plateau={plateau_epochs}/{lr_patience}"
         lr_note = " lr_reduced" if lr_changed else ""
         best_note = f" best={best_output}" if improved else ""
+        if val_metrics:
+            best_note = (
+                f" val_ap={val_metrics['val_ap']:.3f} val_f1={val_metrics['val_f1']:.3f} "
+                f"(P {val_metrics['val_precision']:.3f} R {val_metrics['val_recall']:.3f})" + best_note
+            )
         print(
             f"[train] saved={output} epoch={epoch} mean_loss={mean_loss:.4f} "
             f"best_loss={best_loss:.4f} lr={new_lr:.3g} {status}{lr_note} "
@@ -216,12 +258,59 @@ def train_detector(
         )
 
 
+def run_validation(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    score_threshold: float,
+    center_distance: float,
+) -> dict[str, float]:
+    """Score the model on the validation set with the centre-distance rule used by evaluate-detector."""
+    was_training = model.training
+    model.eval()
+    old_threshold = model.roi_heads.score_thresh
+    model.roi_heads.score_thresh = 0.05
+    predictions: list[PredictionRecord] = []
+    ground_truth: dict[int, list[tuple[float, float, float, float]]] = {}
+    with torch.inference_mode():
+        for images, targets in loader:
+            outputs = model([image.to(device) for image in images])
+            for target, output in zip(targets, outputs):
+                image_id = int(target["image_id"].item())
+                ground_truth[image_id] = [tuple(float(v) for v in box) for box in target["boxes"].tolist()]
+                for box, score, label in zip(
+                    output["boxes"].detach().cpu().tolist(),
+                    output["scores"].detach().cpu().tolist(),
+                    output["labels"].detach().cpu().tolist(),
+                ):
+                    if int(label) == 1:
+                        predictions.append(PredictionRecord(image_id, float(score), tuple(float(v) for v in box)))
+    model.roi_heads.score_thresh = old_threshold
+    if was_training:
+        model.train()
+    total = sum(len(boxes) for boxes in ground_truth.values())
+    scores, flags = rank_predictions_by_center(predictions, ground_truth, center_distance)
+    at_threshold = metrics_at_threshold(scores, flags, total, score_threshold)
+    best = best_operating_point(scores, flags, total)
+    return {
+        "val_ap": average_precision(scores, flags, total),
+        "val_f1": float(at_threshold["f1"]),
+        "val_precision": float(at_threshold["precision"]),
+        "val_recall": float(at_threshold["recall"]),
+        "val_best_f1": float(best["f1"]),
+        "val_best_threshold": float(best["score_threshold"]),
+    }
+
+
 def current_lr(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
 def write_training_log(path: Path, history: list[dict[str, object]]) -> None:
-    fields = ["epoch", "mean_loss", "best_loss", "learning_rate", "plateau_epochs", "lr_reduced", "seconds"]
+    fields = [
+        "epoch", "mean_loss", "best_loss", "learning_rate", "plateau_epochs", "lr_reduced", "seconds",
+        "val_ap", "val_f1", "val_precision", "val_recall", "val_best_f1", "val_best_threshold",
+    ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()

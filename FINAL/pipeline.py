@@ -24,6 +24,11 @@ TOOLS: dict[str, list[str]] = {
     "merge-coco": [str(PIPELINE_ROOT / "Annotation" / "merge_coco_labels.py")],
     "split-coco": [str(PIPELINE_ROOT / "Annotation" / "split_coco.py")],
     "detector": ["-m", "roi_ant_tracker.cli"],
+    "survey-video": ["-m", "roi_ant_tracker.survey"],
+    "analyze-survey": ["-m", "roi_ant_tracker.analyze_survey"],
+    "track-ants": ["-m", "roi_ant_tracker.track_ants"],
+    "trace-video": ["-m", "roi_ant_tracker.trace_video"],
+    "app": [str(PIPELINE_ROOT / "app" / "ant_app.py")],
 }
 
 
@@ -56,6 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--max-empty-fraction", type=float, default=1.0)
     train.add_argument("--device", default="auto")
     train.add_argument("--workers", type=int, default=0)
+    train.add_argument("--val-images")
+    train.add_argument("--val-annotations")
+    train.add_argument("--val-score-threshold", type=float, default=0.30)
 
     track = commands.add_parser("track-video", help="Track ants by searching only inside saved ROIs.")
     track.add_argument("--video", required=True)
@@ -167,6 +175,10 @@ def main() -> None:
                 str(args.workers),
                 *optional_arg("--resume-checkpoint", args.resume_checkpoint),
                 *(["--reset-training-history"] if args.reset_training_history else []),
+                *optional_arg("--val-images", str(Path(args.val_images).resolve()) if args.val_images else None),
+                *optional_arg("--val-annotations", str(Path(args.val_annotations).resolve()) if args.val_annotations else None),
+                "--val-score-threshold",
+                str(args.val_score_threshold),
             ]
         )
     elif args.command == "track-video":
@@ -291,6 +303,8 @@ def run_python(arguments: list[str]) -> None:
     source_root = str(PIPELINE_ROOT / "ML" / "src")
     existing = environment.get("PYTHONPATH", "")
     environment["PYTHONPATH"] = os.pathsep.join([source_root, existing] if existing else [source_root])
+    # On Apple-silicon GPUs, run any operation MPS lacks on the CPU instead of failing.
+    environment.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     command = [sys.executable, *arguments]
     print("[pipeline] " + subprocess.list2cmdline(command))
     subprocess.run(command, check=True, cwd=str(WORKSPACE_ROOT), env=environment)

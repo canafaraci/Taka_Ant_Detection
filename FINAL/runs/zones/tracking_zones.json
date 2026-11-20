@@ -1,0 +1,28 @@
+{
+  "note": "Zones for track-ants rules (full-frame px). Measured 2026-10-30 from frame 360000.",
+  "nest": {
+    "cx": 1795,
+    "cy": 437,
+    "enter_radius": 70,
+    "birth_radius": 90,
+    "note": "Nest = the opening notch in the middle of the slide's bottom edge (measured 2026-11-03). The slide frame itself (x 1630-1975, y 205-432) is NOT nest: ants walking on or around it are tray ants. Detections within 50 px of (1790,442) are dropped (nest_clearance.json), so an ant is lost at ~50-60 px; enter_radius 70 catches that."
+  },
+  "feeders": [
+    {
+      "id": "feeder_left",
+      "cx": 822,
+      "cy": 1465,
+      "cup_radius": 100,
+      "hide_radius": 125,
+      "exit_radius": 160
+    },
+    {
+      "id": "feeder_right",
+      "cx": 2715,
+      "cy": 1467,
+      "cup_radius": 100,
+      "hide_radius": 125,
+      "exit_radius": 160
+    }
+  ]
+}

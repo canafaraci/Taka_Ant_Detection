@@ -1,3 +1,16 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# data and results stay out of git (zones are kept)
+*.mp4
+*.mov
+*.avi
+*.mkv
+FINAL/runs/*
+!FINAL/runs/zones/
+runs/*
+!runs/zones/
+# trained weights come from the GitHub release (setup downloads them)
+checkpoints/ours_*.pt
+.venv/

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.mp4
+*.mov
+*.avi
+*.mkv
+.DS_Store
+FINAL/runs/*
+!FINAL/runs/zones/
+FINAL/checkpoints/ours_*.pt

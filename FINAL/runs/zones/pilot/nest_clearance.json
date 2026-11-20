@@ -1,0 +1,16 @@
+{
+  "zone_version": 1,
+  "video": "pilot video 4h-.mp4 / Pilot video 16h-.mp4",
+  "frame_width": 3840,
+  "frame_height": 2160,
+  "zones": [
+    {
+      "id": "nest_opening_clearance",
+      "type": "circle",
+      "cx": 1827,
+      "cy": 528,
+      "r": 50,
+      "rule": "Detections whose centre is inside are ignored (ants still in the clump at the opening)."
+    }
+  ]
+}

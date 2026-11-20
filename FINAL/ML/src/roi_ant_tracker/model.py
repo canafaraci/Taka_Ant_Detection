@@ -70,12 +70,24 @@ def build_detector(
     return model
 
 
+def mps_available() -> bool:
+    backend = getattr(torch.backends, "mps", None)
+    return bool(backend is not None and backend.is_available())
+
+
 def choose_device(requested: str = "auto") -> torch.device:
+    """auto picks CUDA, then Apple-silicon GPU (MPS), then CPU."""
     if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if mps_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     device = torch.device(requested)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
+    if device.type == "mps" and not mps_available():
+        raise RuntimeError("MPS (Apple GPU) was requested but is not available.")
     return device
 
 

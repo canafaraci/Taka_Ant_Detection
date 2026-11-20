@@ -1,0 +1,9 @@
+{
+  "areas_version": 1,
+  "note": "Area labels for survey detections (full-frame px). First match wins; everything else inside tray_mask.png is 'tray'.",
+  "areas": [
+    {"id": "feeder_left", "type": "rect", "x": 685, "y": 1300, "w": 380, "h": 350},
+    {"id": "feeder_right", "type": "rect", "x": 2493, "y": 1293, "w": 380, "h": 350},
+    {"id": "nest_entrance", "type": "rect", "x": 1610, "y": 400, "w": 390, "h": 130}
+  ]
+}
