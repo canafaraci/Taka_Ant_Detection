@@ -27,6 +27,12 @@ def colour(i: int) -> tuple[int, int, int]:
     return int(c[0]), int(c[1]), int(c[2])
 
 
+def passthrough_flag(ffmpeg: str) -> list[str]:
+    """Keep only the selected frames: '-fps_mode passthrough' on newer ffmpeg, '-vsync 0' on older."""
+    help_text = subprocess.run([ffmpeg, "-hide_banner", "-h", "full"], capture_output=True, text=True).stdout
+    return ["-fps_mode", "passthrough"] if "-fps_mode" in help_text else ["-vsync", "0"]
+
+
 def read_csv(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -53,6 +59,7 @@ def main() -> None:
         alt = Path(man.get("repo_root", ".")) / video
         video = str(alt) if alt.exists() else video
     fps = float(man["fps"])
+    step = int(man.get("frame_step", 1))           # tracking runs may use every Nth frame
     W, H = man["size"]
     w, h = int(round(W * a.scale)) // 2 * 2, int(round(H * a.scale)) // 2 * 2
     zcfg = man.get("zones_config") or {}
@@ -70,9 +77,10 @@ def main() -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         sys.exit("ffmpeg is needed (Mac: brew install ffmpeg).")
+    vf = (f"select=not(mod(n\\,{step}))," if step > 1 else "") + f"scale={w}:{h}"
     dec = subprocess.Popen([ffmpeg, "-v", "error", "-ss", f"{f0 / fps:.3f}", "-t", f"{(f1 - f0 + 1) / fps:.3f}", "-i", video,
-                            "-vf", f"scale={w}:{h}", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
-    enc = subprocess.Popen([ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(fps),
+                            "-vf", vf, *(passthrough_flag(ffmpeg) if step > 1 else []), "-pix_fmt", "bgr24", "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
+    enc = subprocess.Popen([ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(fps / step),
                             "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
                             "-movflags", "+faststart", str(out)], stdin=subprocess.PIPE)
     s = a.scale
@@ -82,13 +90,14 @@ def main() -> None:
     tcache: dict[int, np.ndarray] = {}
     feeders = {f["id"]: dict(f, n_in=0, n_out=0) for f in zcfg.get("feeders", [])}
     n = 0
-    print(f"[trace] {f1 - f0 + 1} frames -> {out} ({w}x{h})", flush=True)
+    n_total = (f1 - f0) // step + 1
+    print(f"[trace] {n_total} frames -> {out} ({w}x{h})", flush=True)
     while True:
         buf = dec.stdout.read(w * h * 3)
         if len(buf) < w * h * 3:
             break
         im = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
-        f = f0 + n
+        f = f0 + n * step
         n += 1
         for e in fe.get(f, []):
             if e["feeder"] in feeders:
@@ -140,7 +149,7 @@ def main() -> None:
                     lw + 2, cv2.LINE_AA)
         enc.stdin.write(im.tobytes())
         if n % a.progress_every == 0:
-            print(f"[trace] {n}/{f1 - f0 + 1} frames", flush=True)
+            print(f"[trace] {n}/{n_total} frames", flush=True)
     enc.stdin.close()
     enc.wait()
     print(f"[trace] done: {n} frames -> {out}", flush=True)

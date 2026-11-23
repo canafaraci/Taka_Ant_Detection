@@ -32,6 +32,18 @@ from zones_io import DEFAULTS, load_zones, save_zones, zones_complete  # noqa: E
 SETTINGS = Path.home() / ".taka_ant_app.json"
 DEFAULT_CKPT = FINAL / "checkpoints" / "ours_v2_best.pt"
 DEFAULT_ZONES = RUNS / "zones"
+DEVICE_SETTINGS = FINAL / "device_settings.json"   # written by check_speed.py for this computer
+
+
+def measured_device() -> dict:
+    try:
+        return json.loads(DEVICE_SETTINGS.read_text())
+    except Exception:
+        return {}
+
+
+BATCH_DEFAULT = str(measured_device().get("batch", 8))
+DEVICE_CHOICES = ["auto", "cuda", "cpu", "mps"]
 
 
 # ------------------------------------------------------------------ helpers
@@ -455,6 +467,21 @@ class ZonesTab(ttk.Frame):
 
 # ------------------------------------------------------------------ Track tab
 
+def device_picker(parent, app: "App") -> ttk.Frame:
+    """'Run on' choice shared by the Track and Survey tabs."""
+    fr = ttk.Frame(parent)
+    m = measured_device()
+    lab = ttk.Label(fr, text="Run on:")
+    lab.pack(side="left")
+    ttk.Combobox(fr, textvariable=app.device, values=DEVICE_CHOICES, width=6, state="readonly").pack(side="left", padx=4)
+    hint = f"(auto = {m['device'].upper()}, measured)" if m.get("device") else "(auto = GPU if available)"
+    ttk.Label(fr, text=hint, foreground="#555").pack(side="left")
+    Tooltip(lab, "auto: what the speed test chose for this computer (or the GPU if no test was run). "
+                 "cuda = NVIDIA GPU, cpu = processor only, mps = Apple GPU. Re-run the speed test with "
+                 ".venv\\Scripts\\python.exe FINAL\\check_speed.py after changing hardware.")
+    return fr
+
+
 # (argument, label, default, help). Defaults must match track_ants.build_parser().
 TRACK_SETTINGS = [
     ("Detection", None, None, None),
@@ -462,6 +489,8 @@ TRACK_SETTINGS = [
     ("crop", "Check area around each ant (px)", "128", "Size of the square checked around each known ant between full searches."),
     ("score-threshold", "Keep detections with score >=", "0.3", "Weakest detection that can continue an ant that is already tracked."),
     ("birth-threshold", "New ant needs score >=", "0.5", "Weakest detection that can start a new ID (at the nest or at a cup)."),
+    ("track-fps", "Track at (frames/s, 0 = all)", "0", "Speed setting. 0 tracks every frame. A lower number skips frames: 7.5 on 15 fps video uses every 2nd frame (about 2x faster), 5 every 3rd. All other settings are in seconds, so they keep working. Below ~5 fast ants are lost more often."),
+    ("batch", "Areas per detector call", BATCH_DEFAULT, "Speed setting. How many image pieces the model checks at once. Default = what the speed test (check_speed.py) found best on this computer. Lower it if you get 'out of memory'."),
     ("Movement", None, None, None),
     ("max-speed", "Fastest ant speed (px/s)", "250", "How far a visible ant may move between frames (divided by the frame rate)."),
     ("merge-radius", "Touching distance (px)", "25", "An ant that vanishes this close to another ant is treated as touching it (both IDs kept)."),
@@ -506,9 +535,10 @@ class TrackTab(ttk.Frame):
             w.grid(row=0, column=2 * i + 1, sticky="w", padx=(0, 16))
         o = ttk.Frame(f)
         o.pack(fill="x")
-        ttk.Checkbutton(o, text="Quick check video while running (overlay.mp4, 1080p)", variable=self.overlay).pack(side="left")
+        ttk.Checkbutton(o, text="Quick check video while running (overlay.mp4, 1080p; costs some speed)", variable=self.overlay).pack(side="left")
         ttk.Label(o, text="   Trace video afterwards:").pack(side="left")
         ttk.Combobox(o, textvariable=self.trace, values=["none", "1080p", "4K"], width=7, state="readonly").pack(side="left")
+        device_picker(o, app).pack(side="left", padx=(16, 0))
         self.settings_vars: dict[str, tk.StringVar] = {}
         saved = app.settings.get("track_settings", {})
         sf = ttk.LabelFrame(f, text="Tracking settings (hover a name for an explanation; times in seconds, distances in full-frame pixels)")
@@ -532,8 +562,8 @@ class TrackTab(ttk.Frame):
         b = ttk.Frame(f)
         b.pack(fill="x", pady=10)
         ttk.Button(b, text="Run tracking", command=self.run).pack(side="left")
-        ttk.Label(b, text="Speed on an Apple-silicon Mac: about 6-7 frames per second, i.e. 10 minutes of 10 fps video take "
-                          "~15 min, 10 minutes of 15 fps video ~23 min.", foreground="#555").pack(side="left", padx=12)
+        ttk.Label(b, text="Speed: the log shows 'x real time'. Lab PC (GTX 1050): about 0.27x on 10 fps video with every frame tracked. "
+                          "Faster: 'Track at' 7.5 or 5, overlay off.", foreground="#555").pack(side="left", padx=12)
         ttk.Label(self, justify="left", foreground="#333", text=(
             "What the tracker does: follows every ant in every frame (any frame rate). Ants never vanish in the open field; new ants only appear\n"
             "at the nest opening; touching ants keep both IDs; ants going into a cup are queued and the first one out gets the\n"
@@ -586,7 +616,8 @@ class TrackTab(ttk.Frame):
         steps = [["track-ants", "--", "--video", rel(v), "--checkpoint", rel(ck), "--output", rel(out),
                   "--mask", rel(zd / "tray_mask.png"), "--zones", rel(zd / "nest_clearance.json"),
                   "--areas", rel(zd / "areas.json"), "--tracking-zones", rel(zd / "tracking_zones.json"),
-                  "--start-seconds", str(s), "--duration-seconds", str(d), *(["--overlay"] if self.overlay.get() else []), *extra]]
+                  "--start-seconds", str(s), "--duration-seconds", str(d), "--device", a.device.get(),
+                  *(["--overlay"] if self.overlay.get() else []), *extra]]
         if self.trace.get() != "none":
             steps.append(["trace-video", "--", "--run", rel(out), "--scale", "1.0" if self.trace.get() == "4K" else "0.5"])
         a.runner.run(steps, f"Tracking {fmt_time(s)} + {d / 60:g} min -> {name}",
@@ -614,7 +645,8 @@ class SurveyTab(ttk.Frame):
         b = ttk.Frame(f)
         b.pack(fill="x", pady=10)
         ttk.Button(b, text="Run survey + analysis", command=self.run).pack(side="left")
-        ttk.Label(b, foreground="#555", text="About 0.6 s per sampled frame: every 5 s over 51.6 h took ~9 h. "
+        device_picker(b, app).pack(side="left", padx=(12, 0))
+        ttk.Label(b, foreground="#555", text="About 0.6 s (Mac) to 1.9 s (lab PC) per sampled frame; every 5 s keeps up with recording. "
                                               "Finished hours are kept, so a stopped survey can be restarted.").pack(side="left", padx=12)
         ttk.Label(self, justify="left", foreground="#333", text=(
             "The survey counts ants (no IDs) on frames spaced through the whole recording, then the analysis makes:\n"
@@ -640,7 +672,7 @@ class SurveyTab(ttk.Frame):
         a.save()
         steps = [["survey-video", "--", "--video", rel(v), "--checkpoint", rel(ck), "--output", rel(out),
                   "--mask", rel(zd / "tray_mask.png"), "--zones", rel(zd / "nest_clearance.json"), "--areas", rel(zd / "areas.json"),
-                  "--step-seconds", str(step), "--start-hour", str(h0), *(["--end-hour", str(h1)] if h1 is not None else [])],
+                  "--step-seconds", str(step), "--device", a.device.get(), "--start-hour", str(h0), *(["--end-hour", str(h1)] if h1 is not None else [])],
                  ["analyze-survey", "--", "--survey", rel(out)]]
         a.runner.run(steps, f"Survey hours {h0}-{h1 if h1 is not None else 'end'}, every {step:g}s -> {name}",
                      on_done=lambda: a.show_results(out))
@@ -833,6 +865,7 @@ class App(tk.Tk):
         self.video = tk.StringVar(value=s.get("video") or (str(guess_video) if guess_video else ""))
         self.ckpt = tk.StringVar(value=s.get("ckpt") or str(DEFAULT_CKPT))
         self.zones_dir = tk.StringVar(value=s.get("zones_dir") or str(DEFAULT_ZONES))
+        self.device = tk.StringVar(value=s.get("device") if s.get("device") in DEVICE_CHOICES else "auto")
         self.runner = Runner(self)
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True)
@@ -860,7 +893,7 @@ class App(tk.Tk):
             self.after(300, self.zones.load_existing)
 
     def save(self):
-        self.settings.update(video=self.video.get(), ckpt=self.ckpt.get(), zones_dir=self.zones_dir.get())
+        self.settings.update(video=self.video.get(), ckpt=self.ckpt.get(), zones_dir=self.zones_dir.get(), device=self.device.get())
         if hasattr(self, "track"):
             self.settings["track_settings"] = {k: v.get() for k, v in self.track.settings_vars.items()}
         save_settings(self.settings)

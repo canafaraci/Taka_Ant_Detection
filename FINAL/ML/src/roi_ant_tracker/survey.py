@@ -211,7 +211,8 @@ def detect_frame(model, device, frame, origins, always, tile, gate, batch, thr, 
             chunk = run[i:i + batch]
             tensors = [torch.from_numpy(np.ascontiguousarray(c[2][:, :, ::-1])).permute(2, 0, 1).float().div(255.0).to(device)
                        for c in chunk]
-            tensors += [torch.zeros_like(tensors[0])] * (batch - len(tensors))   # same batch shape every call
+            if device.type == "mps":   # Apple GPU slows down when batch shapes change; CUDA/CPU don't need padding
+                tensors += [torch.zeros_like(tensors[0])] * (batch - len(tensors))
             for (x, y, _), out in zip(chunk, model(tensors)):
                 keep = (out["labels"] == 1) & (out["scores"] >= thr)
                 b = out["boxes"][keep].detach().cpu()

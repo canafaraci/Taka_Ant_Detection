@@ -75,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start-seconds", type=float, default=0.0)
     p.add_argument("--duration-seconds", type=float, default=60.0)
     p.add_argument("--sweep-seconds", type=float, default=2.0, help="Time between full-tray detections.")
+    p.add_argument("--track-fps", type=float, default=0.0,
+                   help="Frames per second to track (0 = every frame). E.g. 7.5 on 15 fps video uses every 2nd frame, ~2x faster.")
     p.add_argument("--crop", type=int, default=128)
     p.add_argument("--scale", type=float, default=2.4)
     p.add_argument("--score-threshold", type=float, default=0.3)
@@ -135,7 +137,8 @@ def detect_crops(model, device, frame, centers, crop, scale, batch, thr):
             chunk = origins[i:i + batch]
             tensors = [torch.from_numpy(np.ascontiguousarray(frame[y:y + crop, x:x + crop, ::-1])).permute(2, 0, 1)
                        .float().div(255.0).to(device) for x, y in chunk]
-            tensors += [torch.zeros_like(tensors[0])] * (batch - len(tensors))   # same shape every call
+            if device.type == "mps":   # Apple GPU slows down when batch shapes change; CUDA/CPU don't need padding
+                tensors += [torch.zeros_like(tensors[0])] * (batch - len(tensors))
             for (x, y), out in zip(chunk, model(tensors)):
                 keep = (out["labels"] == 1) & (out["scores"] >= thr)
                 b = out["boxes"][keep].detach().cpu()
@@ -647,16 +650,20 @@ def main() -> None:
     tile_size = round(a.tile * a.scale)
     nest_crops = [(zcfg["nest"]["cx"] + dx, zcfg["nest"]["cy"] + 60) for dx in (-110, 0, 110)]
 
+    step = max(1, int(round(fps / a.track_fps))) if a.track_fps and a.track_fps > 0 else 1
+    tfps = fps / step                                    # frame rate the tracker sees
     f0 = int(round(a.start_seconds * fps))
+    f0 -= f0 % step
     f1 = min(n_frames, f0 + int(round(a.duration_seconds * fps)))
     use_ffmpeg = a.decoder == "ffmpeg" or (a.decoder == "auto" and shutil.which("ffmpeg"))
-    src = frames_ffmpeg(a.video, f0, f1, 1, fps, w, h, False) if use_ffmpeg else frames_opencv(a.video, f0, f1, 1)
+    src = frames_ffmpeg(a.video, f0, f1, step, fps, w, h, False) if use_ffmpeg else frames_opencv(a.video, f0, f1, step)
 
     out = Path(a.output)
     out.mkdir(parents=True, exist_ok=True)
-    tr = ConservedTracker(a, fps, zcfg)
-    sweep_every = max(1, int(round(a.sweep_seconds * fps)))
-    static = StaticSpots(int(round(a.static_minutes * 60 * fps / sweep_every)), a.static_fraction)
+    # The tracker counts in tracked frames (index = video frame // step) at tfps; outputs use video frame numbers.
+    tr = ConservedTracker(a, tfps, zcfg)
+    sweep_every = max(1, int(round(a.sweep_seconds * tfps)))
+    static = StaticSpots(int(round(a.static_minutes * 60 * tfps / sweep_every)), a.static_fraction)
     cal = json.loads(Path(a.calibration).read_text())["bins"] if Path(a.calibration).exists() else []
 
     def p_ant(score: float) -> float:
@@ -664,9 +671,10 @@ def main() -> None:
             if b_["lo"] <= score < b_["hi"]:
                 return b_["p_ant"]
         return score
-    (out / "track_manifest.json").write_text(json.dumps(dict(vars(a), fps=fps, size=[w, h], device=str(device),
+    (out / "track_manifest.json").write_text(json.dumps(dict(vars(a), fps=fps, frame_step=step, tracked_fps=tfps,
+                                                             size=[w, h], device=str(device), batch=a.batch,
                                                              zones_config=zcfg), indent=2))
-    writer = cv2.VideoWriter(str(out / "overlay.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (1920, 1080)) if a.overlay else None
+    writer = cv2.VideoWriter(str(out / "overlay.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), tfps, (1920, 1080)) if a.overlay else None
     trails: dict[int, deque] = defaultdict(lambda: deque(maxlen=a.trail or None))
     _tcache: dict[int, tuple[int, np.ndarray]] = {}
 
@@ -681,12 +689,15 @@ def main() -> None:
         return arr
     t_start, n, t_sweep, t_local, n_sweep = time.time(), 0, 0.0, 0.0, 0
     count_rows: list[dict] = []
-    print(f"[track] frames {f0}-{f1} ({(f1 - f0) / fps:.0f} s at {fps:g} fps, {w}x{h}), full sweep every {sweep_every} frames, "
-          f"device={device}", flush=True)
+    n_total = len(range(f0, f1, step))
+    print(f"[track] frames {f0}-{f1} ({(f1 - f0) / fps:.0f} s at {fps:g} fps, {w}x{h}), "
+          f"{'every frame' if step == 1 else f'every {step}th frame ({tfps:g} fps tracked)'}, full sweep every {sweep_every} tracked frames, "
+          f"device={device}, batch {a.batch}", flush=True)
     with (out / "tracks.csv").open("w", newline="") as fh:
         wr = csv.writer(fh)
         wr.writerow(FIELDS)
         for fidx, frame in src:
+            vf = fidx // step                            # tracker frame index
             tt = time.time()
             sweep = (n % sweep_every == 0) or not tr.ants
             if sweep:
@@ -707,13 +718,13 @@ def main() -> None:
                     dets.append((box, sc))
             if sweep:
                 for sx, sy in static.add_sweep([((b_[0] + b_[2]) / 2, (b_[1] + b_[3]) / 2) for b_, _ in dets]):
-                    tr.mark_static(fidx, sx, sy)
+                    tr.mark_static(vf, sx, sy)
             dets = [(b_, s_) for b_, s_ in dets if not static.is_static((b_[0] + b_[2]) / 2, (b_[1] + b_[3]) / 2)]
-            tr.update(fidx, dets, first_frame=(n == 0))
+            tr.update(vf, dets, first_frame=(n == 0))
             for t in tr.ants.values():
                 if t.state in ("nest", "feeder"):
                     continue
-                obs = int(t.last_seen == fidx and t.state in ("active", "dead"))
+                obs = int(t.last_seen == vf and t.state in ("active", "dead"))
                 wr.writerow([fidx, round(fidx / fps, 2), t.tid, t.state, round(t.x, 1), round(t.y, 1),
                              *[round(v, 1) for v in t.box], round(t.score, 3) if obs else "",
                              round(p_ant(t.score), 3) if obs else "", obs,
@@ -755,7 +766,7 @@ def main() -> None:
                                  f" (lost {counts['lost']})  in feeders {counts['feeder']}  dead {counts['dead']}"
                                  f"{'  [sweep]' if sweep else ''}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 writer.write(vis)
-            if n % int(round(fps)) == 0:
+            if n % max(1, int(round(tfps))) == 0:
                 st_ = defaultdict(int)
                 for t in tr.ants.values():
                     st_[t.state] += 1
@@ -773,7 +784,7 @@ def main() -> None:
                 st = defaultdict(int)
                 for t in tr.ants.values():
                     st[t.state] += 1
-                print(f"[track] {n}/{f1 - f0} frames  {n / el:.1f} fps ({n / el / fps:.2f}x real time)  IDs {len(tr.ants)} "
+                print(f"[track] {n}/{n_total} frames  {n / el:.1f} fps ({n / el / tfps:.2f}x real time)  IDs {len(tr.ants)} "
                       f"{ {k: v for k, v in st.items() if k != 'nest'} }  feeder in/out {sum(e['event'] == 'in' for e in tr.feeder_events)}/"
                       f"{sum(e['event'] == 'out' for e in tr.feeder_events)}  ignored dets {len(tr.ignored)}  "
                       f"sweep {1000 * t_sweep / max(n_sweep, 1):.0f} ms  local {1000 * t_local / max(n - n_sweep, 1):.0f} ms", flush=True)
@@ -782,6 +793,12 @@ def main() -> None:
     for v in list(tr.open_visit.values()):                  # still inside when the clip ends
         if not v.get("pending"):
             tr.close_visit(dict(v, track_id_out="", exit_frame=""))
+    if step > 1:                                         # tracker frame index -> video frame number
+        for lst in (tr.events, tr.feeder_events, tr.visits, tr.ignored, tr.nest_events):
+            for e in lst:
+                for k in ("frame", "enter_frame", "exit_frame"):
+                    if isinstance(e.get(k), (int, np.integer)):
+                        e[k] = int(e[k]) * step
     tr.feeder_events.sort(key=lambda e: e["frame"])
     write_csv(out / "feeder_visits.csv", tr.visits, ["feeder", "track_id_in", "track_id_out", "enter_frame", "enter_sec",
                                                       "exit_frame", "exit_sec", "duration_sec"])
@@ -801,12 +818,12 @@ def main() -> None:
     write_csv(out / "counts.csv", count_rows, list(count_rows[0].keys()) if count_rows else ["frame"])
     write_csv(out / "events.csv", tr.events, ["frame", "t_sec", "event", "track_id", "x", "y", "note"])
     write_csv(out / "ignored_detections.csv", tr.ignored, ["frame", "t_sec", "cx", "cy", "score", "area"])
-    summarise(out / "tracks.csv", tr, out / "tracks_summary.csv", fps)
+    summarise(out / "tracks.csv", tr, out / "tracks_summary.csv", tfps)
     el = time.time() - t_start
     st = defaultdict(int)
     for t in tr.ants.values():
         st[t.state] += 1
-    print(f"[track] done: {n} frames in {el / 60:.1f} min ({n / max(el, 1e-6) / fps:.2f}x real time); {len(tr.ants)} IDs "
+    print(f"[track] done: {n} frames in {el / 60:.1f} min ({n / max(el, 1e-6) / tfps:.2f}x real time); {len(tr.ants)} IDs "
           f"{ {k: v for k, v in st.items() if k != 'nest'} }; feeder in {sum(e['event'] == 'in' for e in tr.feeder_events)}, out "
           f"{sum(e['event'] == 'out' for e in tr.feeder_events)}, completed visits {sum(v['exit_sec'] != '' for v in tr.visits)}; "
           f"ignored detections {len(tr.ignored)} -> {out}", flush=True)
