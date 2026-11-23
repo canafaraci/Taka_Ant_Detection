@@ -79,6 +79,28 @@ def parse_time(text: str) -> float:
     return v * {"h": 3600, "m": 60, "s": 1, "": 1}[m.group(2)]
 
 
+def video_details(path: str) -> dict | None:
+    """fps, frame count, size and length of a video (None if it cannot be opened)."""
+    try:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+    except Exception:
+        return None
+    if fps <= 0:
+        return None
+    return dict(fps=fps, frames=n, width=w, height=h, seconds=n / fps)
+
+
+def default_track_fps(fps: float) -> str:
+    """Track every 2nd frame: 15 fps -> 7.5, 10 fps -> 5 (lab PC speed setting)."""
+    return f"{fps / 2:g}" if fps >= 9 else "0"
+
+
 def fmt_time(sec: float) -> str:
     sec = int(round(sec))
     return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
@@ -535,6 +557,9 @@ class TrackTab(ttk.Frame):
             w.grid(row=0, column=2 * i + 1, sticky="w", padx=(0, 16))
         o = ttk.Frame(f)
         o.pack(fill="x")
+        self.info = ttk.Label(f, text="", foreground="#0a5")
+        self.info.pack(anchor="w", pady=(0, 4))
+        self.video_fps: float | None = None
         ttk.Checkbutton(o, text="Quick check video while running (overlay.mp4, 1080p; costs some speed)", variable=self.overlay).pack(side="left")
         ttk.Label(o, text="   Trace video afterwards:").pack(side="left")
         ttk.Combobox(o, textvariable=self.trace, values=["none", "1080p", "4K"], width=7, state="readonly").pack(side="left")
@@ -558,10 +583,13 @@ class TrackTab(ttk.Frame):
             ttk.Entry(sf, textvariable=v, width=7).grid(row=row, column=2 * col + 1, sticky="w", padx=(0, 14), pady=1)
             Tooltip(lab, helptext)
             row += 1
+        app.video.trace_add("write", lambda *_: self.after_idle(self.video_changed))
+        self.after(200, lambda: self.video_changed(initial=True))
         ttk.Button(sf, text="Reset to defaults", command=self.reset_settings).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=6)
         b = ttk.Frame(f)
         b.pack(fill="x", pady=10)
         ttk.Button(b, text="Run tracking", command=self.run).pack(side="left")
+        ttk.Button(b, text="Track whole video", command=lambda: self.run(whole=True)).pack(side="left", padx=(8, 0))
         ttk.Label(b, text="Speed: the log shows 'x real time'. Lab PC (GTX 1050): about 0.27x on 10 fps video with every frame tracked. "
                           "Faster: 'Track at' 7.5 or 5, overlay off.", foreground="#555").pack(side="left", padx=12)
         ttk.Label(self, justify="left", foreground="#333", text=(
@@ -575,6 +603,29 @@ class TrackTab(ttk.Frame):
         for arg, label, default, _ in TRACK_SETTINGS:
             if label is not None:
                 self.settings_vars[arg].set(default)
+        if self.video_fps:
+            self.settings_vars["track-fps"].set(default_track_fps(self.video_fps))
+
+    def video_changed(self, initial: bool = False):
+        """Read the new video's frame rate and fill 'Track at' (still editable)."""
+        v = self.app.video.get()
+        info = video_details(v) if v and Path(v).exists() else None
+        if info is None:
+            self.video_fps = None
+            self.info.config(text="")
+            return
+        same = initial and self.app.settings.get("track_settings_video") == v
+        self.video_fps = info["fps"]
+        if not same:            # keep values saved for this same video; a new video gets its own default
+            self.settings_vars["track-fps"].set(default_track_fps(info["fps"]))
+        tf = self.settings_vars["track-fps"].get().strip()
+        try:
+            n = max(1, round(info["fps"] / float(tf))) if float(tf) > 0 else 1
+        except ValueError:
+            n = 1
+        which = "every frame" if n == 1 else f"every {n}{ {2: 'nd', 3: 'rd'}.get(n, 'th') } frame"
+        self.info.config(text=f"Video: {info['fps']:g} fps, {info['width']}x{info['height']}, length {fmt_time(info['seconds'])}"
+                              f"   ->   'Track at' = {tf} frames/s ({which}); you can change it below")
 
     def setting_args(self) -> list[str] | None:
         out = []
@@ -591,7 +642,7 @@ class TrackTab(ttk.Frame):
         self.app.settings["track_settings"] = {k: v.get() for k, v in self.settings_vars.items()}
         return out
 
-    def run(self):
+    def run(self, whole: bool = False):
         a = self.app
         v, ck, zd = a.video.get(), a.ckpt.get(), Path(a.zones_dir.get() or DEFAULT_ZONES)
         if not Path(v).exists():
@@ -604,11 +655,28 @@ class TrackTab(ttk.Frame):
         miss = zones_complete(zd)
         if miss:
             return messagebox.showerror("Track", f"Zones folder is missing: {', '.join(miss)}.\nSet and save zones in the Zones tab.")
-        try:
-            s, d = parse_time(self.start.get()), float(self.dur.get()) * 60
-        except ValueError as e:
-            return messagebox.showerror("Track", str(e))
-        name = self.name.get().strip() or f"track_{Path(v).stem[:20].replace(' ', '_')}_{fmt_time(s).replace(':', '-')}_{int(d // 60)}min"
+        if whole:
+            info = video_details(v)
+            if info is None:
+                return messagebox.showerror("Track", "Could not read the video's length.")
+            s, d = 0.0, info["seconds"] + 1
+            tf = float(self.settings_vars["track-fps"].get() or 0)
+            note = (f"Track the whole video ({fmt_time(info['seconds'])}) in one run"
+                    f"{f' at {tf:g} frames/s' if tf > 0 else ' (every frame)'}?\n\n"
+                    "On the lab PC this takes roughly 2-2.5x the video length at 'Track at' = half the frame rate, "
+                    "and ~4-5x with every frame. Stop ends it early, but then the summary files (counts, feeder visits) are not written.")
+            if self.overlay.get() or self.trace.get() != "none":
+                note += "\n\nThe quick check video and trace video add a lot of time on a long run - consider turning them off."
+            if not messagebox.askyesno("Track whole video", note):
+                return
+            default_name = f"track_{Path(v).stem[:20].replace(' ', '_')}_whole"
+        else:
+            try:
+                s, d = parse_time(self.start.get()), float(self.dur.get()) * 60
+            except ValueError as e:
+                return messagebox.showerror("Track", str(e))
+            default_name = f"track_{Path(v).stem[:20].replace(' ', '_')}_{fmt_time(s).replace(':', '-')}_{int(d // 60)}min"
+        name = self.name.get().strip() or default_name
         out = RUNS / name
         if out.exists() and any(out.iterdir()) and not messagebox.askyesno("Track", f"{out.name} already exists. Overwrite?"):
             return
@@ -620,7 +688,7 @@ class TrackTab(ttk.Frame):
                   *(["--overlay"] if self.overlay.get() else []), *extra]]
         if self.trace.get() != "none":
             steps.append(["trace-video", "--", "--run", rel(out), "--scale", "1.0" if self.trace.get() == "4K" else "0.5"])
-        a.runner.run(steps, f"Tracking {fmt_time(s)} + {d / 60:g} min -> {name}",
+        a.runner.run(steps, f"Tracking {'whole video' if whole else f'{fmt_time(s)} + {d / 60:g} min'} -> {name}",
                      on_done=lambda: a.show_results(out))
 
 
@@ -896,6 +964,7 @@ class App(tk.Tk):
         self.settings.update(video=self.video.get(), ckpt=self.ckpt.get(), zones_dir=self.zones_dir.get(), device=self.device.get())
         if hasattr(self, "track"):
             self.settings["track_settings"] = {k: v.get() for k, v in self.track.settings_vars.items()}
+            self.settings["track_settings_video"] = self.video.get()
         save_settings(self.settings)
 
     def log(self, text: str):
