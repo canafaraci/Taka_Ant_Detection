@@ -148,6 +148,120 @@ def read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+# ------------------------------------------------------------------ run-time estimates
+
+# Lab PC (GTX 1050) measurements; replaced by what this computer measured once a job of that kind has run.
+SPEED_DEFAULTS = dict(sweep_s=1.76,      # s per full-tray search (tracking)
+                      frame_s=0.20,      # s per tracked frame for the checks around each ant + decoding
+                      overlay_s=0.06,    # extra s per tracked frame when the quick check video is written
+                      survey_s=1.85,     # s per sampled survey frame
+                      trace_fps_1080p=12.0, trace_fps_4k=4.0)   # trace video frames per second
+_VINFO: dict = {}
+
+
+def vinfo(path: str) -> dict | None:
+    """video_details(), cached."""
+    try:
+        p = Path(path) if Path(path).is_absolute() else REPO / path
+        key = (str(p), p.stat().st_mtime)
+    except OSError:
+        return None
+    if key not in _VINFO:
+        _VINFO[key] = video_details(str(p))
+    return _VINFO[key]
+
+
+def speed_model(app: "App") -> tuple[dict, bool]:
+    """(speeds, learned): learned = at least one tracking run has been timed on this computer."""
+    m = dict(SPEED_DEFAULTS)
+    learned = app.settings.get("speed", {})
+    if not learned.get("sweep_s"):                       # nothing timed yet: scale the lab PC numbers by the speed test
+        md = measured_device()
+        try:
+            k = md["measured"][md["device"]]["sec_per_tile"] / 0.0384
+            for key in ("sweep_s", "frame_s", "survey_s"):
+                m[key] *= k
+        except Exception:
+            pass
+    m.update({k: v for k, v in learned.items() if isinstance(v, (int, float)) and v > 0})
+    return m, bool(learned.get("sweep_s"))
+
+
+def _arg(args: list[str], name: str, default=None):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+
+
+def est_track(app, seconds: float, video_fps: float, track_fps: float, sweep_s: float, overlay: bool) -> float:
+    m, _ = speed_model(app)
+    step = max(1, round(video_fps / track_fps)) if track_fps > 0 else 1
+    return seconds * (m["sweep_s"] / max(sweep_s, 0.1) + (m["frame_s"] + (m["overlay_s"] if overlay else 0)) * video_fps / step)
+
+
+def est_trace(app, seconds: float, tracked_fps: float, scale: float) -> float:
+    m, _ = speed_model(app)
+    return seconds * tracked_fps / m["trace_fps_4k" if scale >= 0.99 else "trace_fps_1080p"]
+
+
+def est_survey(app, seconds: float, step_s: float) -> float:
+    m, _ = speed_model(app)
+    return seconds / max(step_s, 0.1) * m["survey_s"] + 60
+
+
+def estimate_step(app, args: list[str]) -> float | None:
+    """Seconds one pipeline step should take on this computer (None if unknown)."""
+    kind = args[0]
+    try:
+        if kind == "track-ants":
+            info = vinfo(_arg(args, "--video", ""))
+            if not info:
+                return None
+            start = float(_arg(args, "--start-seconds", 0))
+            dur = min(float(_arg(args, "--duration-seconds", 60)), max(info["seconds"] - start, 0))
+            return est_track(app, dur, info["fps"], float(_arg(args, "--track-fps", 0)), float(_arg(args, "--sweep-seconds", 2)),
+                             "--overlay" in args)
+        if kind == "trace-video":
+            run = Path(_arg(args, "--run", ""))
+            run = run if run.is_absolute() else REPO / run
+            man = run / "track_manifest.json"
+            if man.exists():
+                mj = json.loads(man.read_text())
+                tf = float(mj.get("tracked_fps") or mj.get("fps") or 10)
+                return est_trace(app, float(mj.get("duration_seconds", 60)), tf, float(_arg(args, "--scale", 1.0)))
+            return None
+        if kind == "survey-video":
+            info = vinfo(_arg(args, "--video", ""))
+            if not info:
+                return None
+            h0 = float(_arg(args, "--start-hour", 0))
+            h1 = _arg(args, "--end-hour")
+            end = min(info["seconds"], float(h1) * 3600) if h1 is not None else info["seconds"]
+            return est_survey(app, max(end - h0 * 3600, 0), float(_arg(args, "--step-seconds", 5)))
+        if kind == "experiment-results":
+            return 5 if "--check" in args else 60
+        if kind == "analyze-survey":
+            return 90
+    except Exception:
+        return None
+    return None
+
+
+def fmt_dur(sec: float | None) -> str:
+    if sec is None:
+        return "unknown"
+    sec = max(0, int(round(sec)))
+    if sec < 60:
+        return "under a minute"
+    if sec < 3600:
+        return f"~{round(sec / 60)} min"
+    h, mi = divmod(round(sec / 60), 60)
+    return f"~{h} h {mi:02d} min" if h < 48 else f"~{sec / 86400:.1f} days"
+
+
+def estimate_note(app) -> str:
+    _, learned = speed_model(app)
+    return "(timed on this computer)" if learned else "(rough estimate - gets accurate after the first tracking run on this computer)"
+
+
 # ------------------------------------------------------------------ job runner (one job at a time)
 
 class Runner:
@@ -157,6 +271,11 @@ class Runner:
         self.q: queue.Queue = queue.Queue()
         self.steps: list[list[str]] = []
         self.on_done = None
+        self.n_steps, self.step_no, self.cur_args, self.t_step = 0, 0, [], 0.0
+        self.obs: dict = {}
+
+    def remaining_estimate(self) -> float:
+        return sum(estimate_step(self.app, st) or 0 for st in self.steps)
 
     @property
     def busy(self) -> bool:
@@ -167,8 +286,12 @@ class Runner:
             messagebox.showwarning("Busy", "A job is already running. Stop it first or wait for it to finish.")
             return
         self.steps, self.on_done = list(steps), on_done
+        self.n_steps, self.step_no = len(steps), 0
         self.app.log_clear()
         self.app.log(f"=== {title} ===\n")
+        total = [estimate_step(self.app, st) for st in steps]
+        if any(t is not None for t in total):
+            self.app.log(f"Estimated time: {fmt_dur(sum(t or 0 for t in total))} {estimate_note(self.app)}\n")
         self.app.set_status(title, running=True)
         self._next()
 
@@ -180,6 +303,8 @@ class Runner:
                 self.app.after(100, self.on_done)
             return
         args = self.steps.pop(0)
+        self.step_no += 1
+        self.cur_args, self.t_step, self.obs = args, time.time(), dict(done_before=0, hour=None)
         cmd = [sys.executable, str(FINAL / "pipeline.py"), *args]
         self.app.log("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd[1:]) + "\n")
         env = dict(os.environ, PYTHONUNBUFFERED="1")
@@ -200,6 +325,8 @@ class Runner:
                 item = self.q.get_nowait()
                 if isinstance(item, tuple):
                     code = item[1]
+                    if code == 0:
+                        self.learn()
                     if code != 0:
                         self.app.log(f"\n[stopped with exit code {code}]\n")
                         self.proc, self.steps = None, []
@@ -211,12 +338,72 @@ class Runner:
                 m = re.search(r"(\d+)/(\d+) frames", item)
                 if m:
                     self.app.set_progress(int(m.group(1)), int(m.group(2)))
-                m = re.search(r"([\d.]+)x real time", item)
-                if m:
-                    self.app.set_status(f"Running  ({m.group(1)}x real time)", running=True)
+                self.observe(item)
         except queue.Empty:
             pass
         self.app.after(200, self._poll)
+
+    def observe(self, line: str) -> None:
+        """Pick timing figures out of a log line, show the time left."""
+        o, kind = self.obs, self.cur_args[0] if self.cur_args else ""
+        m = re.search(r"full sweep every (\d+) tracked frames", line)
+        if m:
+            o["sweep_every"] = int(m.group(1))
+        m = re.search(r"(\d+)/(\d+) frames\s+([\d.]+) fps \(([\d.]+)x real time\).*sweep (\d+) ms\s+local (\d+) ms", line)
+        if m:
+            o.update(n=int(m.group(1)), fps=float(m.group(3)), rt=m.group(4), sweep_ms=int(m.group(5)))
+        m = re.search(r"\[survey\] (\S+): (\d+)/(\d+) frames, ([\d.]+) s/frame", line)
+        if m:
+            if o.get("hour") not in (None, m.group(1)):
+                o["done_before"] += o.get("hour_total", 0)
+            o.update(hour=m.group(1), hour_n=int(m.group(2)), hour_total=int(m.group(3)), s_per_frame=float(m.group(4)))
+        m = re.search(r"\[trace\] done: (\d+) frames", line)
+        if m:
+            o["trace_frames"] = int(m.group(1))
+        # time left in this step
+        left = None
+        el = time.time() - self.t_step
+        p = re.search(r"(\d+)/(\d+) frames", line)
+        if kind == "survey-video" and o.get("s_per_frame"):
+            info = vinfo(_arg(self.cur_args, "--video", ""))
+            est = estimate_step(self.app, self.cur_args)
+            if info and est:
+                total_frames = (est - 60) / max(speed_model(self.app)[0]["survey_s"], 1e-6)
+                left = max(total_frames - o["done_before"] - o["hour_n"], 0) * o["s_per_frame"] + 60
+        elif p and int(p.group(1)) > 0:
+            n, tot = int(p.group(1)), int(p.group(2))
+            left = el * (tot - n) / n
+        if left is None:
+            return
+        left += self.remaining_estimate()
+        step = f"step {self.step_no}/{self.n_steps}  " if self.n_steps > 1 else ""
+        rt = f"({o['rt']}x real time) " if kind == "track-ants" and o.get("rt") else ""
+        d = fmt_dur(left)
+        self.app.set_status(f"Running {step}{rt}" + (f"about {d.lstrip('~')} left" if d.startswith("~") else f"{d} left"), running=True)
+
+    def learn(self) -> None:
+        """Remember how fast this computer was, for the next estimates."""
+        o, args, sp = self.obs, self.cur_args, self.app.settings.setdefault("speed", {})
+        try:
+            kind = args[0]
+            if kind == "track-ants" and o.get("n", 0) >= 200 and o.get("fps") and o.get("sweep_every"):
+                sweep = o["sweep_ms"] / 1000
+                per_frame = max(1 / o["fps"] - sweep / o["sweep_every"], 0.01)
+                sp["sweep_s"] = round(sweep, 3)
+                if "--overlay" in args:
+                    sp["overlay_s"] = round(max(per_frame - sp.get("frame_s", SPEED_DEFAULTS["frame_s"]), 0.0), 3)
+                else:
+                    sp["frame_s"] = round(per_frame, 3)
+            elif kind == "survey-video" and o.get("s_per_frame"):
+                sp["survey_s"] = round(o["s_per_frame"], 3)
+            elif kind == "trace-video" and o.get("trace_frames"):
+                fps = o["trace_frames"] / max(time.time() - self.t_step, 1e-6)
+                sp["trace_fps_4k" if float(_arg(args, "--scale", 1.0)) >= 0.99 else "trace_fps_1080p"] = round(fps, 2)
+            else:
+                return
+            save_settings(self.app.settings)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         if self.proc:
@@ -590,14 +777,45 @@ class TrackTab(ttk.Frame):
         b.pack(fill="x", pady=10)
         ttk.Button(b, text="Run tracking", command=self.run).pack(side="left")
         ttk.Button(b, text="Track whole video", command=lambda: self.run(whole=True)).pack(side="left", padx=(8, 0))
-        ttk.Label(b, text="Speed: the log shows 'x real time'. Lab PC (GTX 1050): about 0.27x on 10 fps video with every frame tracked. "
-                          "Faster: 'Track at' 7.5 or 5, overlay off.", foreground="#555").pack(side="left", padx=12)
+        self.est_lbl = ttk.Label(b, text="", foreground="#555")
+        self.est_lbl.pack(side="left", padx=12)
+        self.after(500, self.update_estimate)
         ttk.Label(self, justify="left", foreground="#333", text=(
             "What the tracker does: follows every ant in every frame (any frame rate). Ants never vanish in the open field; new ants only appear\n"
             "at the nest opening; touching ants keep both IDs; ants going into a cup are queued and the first one out gets the\n"
             "first ID in; anything that has not moved for 5 minutes is marked dead for good.\n"
             "Outputs (in FINAL/runs/<run name>): counts.csv (ants on tray, in each feeder, dead - every second), feeder_events.csv,\n"
             "feeder_visits.csv, tracks.csv, tracks_summary.csv, overlay.mp4 / trace video.")).pack(anchor="w", padx=10)
+
+    def total_estimate(self, seconds: float, info: dict) -> float:
+        tf = float(self.settings_vars["track-fps"].get() or 0)
+        sw = float(self.settings_vars["sweep-seconds"].get() or 2)
+        t = est_track(self.app, seconds, info["fps"], tf, sw, self.overlay.get())
+        if self.trace.get() != "none":
+            step = max(1, round(info["fps"] / tf)) if tf > 0 else 1
+            t += est_trace(self.app, seconds, info["fps"] / step, 1.0 if self.trace.get() == "4K" else 0.5)
+        return t
+
+    def update_estimate(self):
+        """Keep the time estimate next to the Run buttons up to date."""
+        try:
+            info = vinfo(self.app.video.get())
+            if info:
+                try:
+                    start, dur = parse_time(self.start.get()), float(self.dur.get()) * 60
+                except ValueError:
+                    start, dur = 0.0, 0.0
+                dur = max(0.0, min(dur, info["seconds"] - start))
+                extra = " incl. trace video" if self.trace.get() != "none" else ""
+                txt = (f"Estimated time{extra}: this clip {fmt_dur(self.total_estimate(dur, info))}, whole video "
+                       f"{fmt_dur(self.total_estimate(info['seconds'], info))}  {estimate_note(self.app)}")
+            else:
+                txt = "Choose a video to see time estimates."
+        except (ValueError, ZeroDivisionError):
+            txt = "Estimated time: check the settings (numbers only)."
+        if self.est_lbl.cget("text") != txt:
+            self.est_lbl.config(text=txt)
+        self.after(1500, self.update_estimate)
 
     def reset_settings(self):
         for arg, label, default, _ in TRACK_SETTINGS:
@@ -663,8 +881,9 @@ class TrackTab(ttk.Frame):
             tf = float(self.settings_vars["track-fps"].get() or 0)
             note = (f"Track the whole video ({fmt_time(info['seconds'])}) in one run"
                     f"{f' at {tf:g} frames/s' if tf > 0 else ' (every frame)'}?\n\n"
-                    "On the lab PC this takes roughly 2-2.5x the video length at 'Track at' = half the frame rate, "
-                    "and ~4-5x with every frame. Stop ends it early, but then the summary files (counts, feeder visits) are not written.")
+                    f"Estimated time{' incl. trace video' if self.trace.get() != 'none' else ''}: "
+                    f"{fmt_dur(self.total_estimate(info['seconds'], info))} {estimate_note(a)}.\n\n"
+                    "Stop ends it early, but then the summary files (counts, feeder visits) are not written.")
             if self.overlay.get() or self.trace.get() != "none":
                 note += "\n\nThe quick check video and trace video add a lot of time on a long run - consider turning them off."
             if not messagebox.askyesno("Track whole video", note):
@@ -714,12 +933,32 @@ class SurveyTab(ttk.Frame):
         b.pack(fill="x", pady=10)
         ttk.Button(b, text="Run survey + analysis", command=self.run).pack(side="left")
         device_picker(b, app).pack(side="left", padx=(12, 0))
-        ttk.Label(b, foreground="#555", text="About 0.6 s (Mac) to 1.9 s (lab PC) per sampled frame; every 5 s keeps up with recording. "
-                                              "Finished hours are kept, so a stopped survey can be restarted.").pack(side="left", padx=12)
+        self.est_lbl = ttk.Label(b, foreground="#555", text="")
+        self.est_lbl.pack(side="left", padx=12)
+        ttk.Label(f, foreground="#555", text="Finished hours are kept, so a stopped survey can be restarted.").pack(anchor="w")
+        self.after(700, self.update_estimate)
         ttk.Label(self, justify="left", foreground="#333", text=(
             "The survey counts ants (no IDs) on frames spaced through the whole recording, then the analysis makes:\n"
             "hourly counts (moving / stationary / permanent), feeder occupancy, heatmaps of where ants go and rest,\n"
             "and a list of objects that never move. The analysis needs: pip install pandas matplotlib")).pack(anchor="w", padx=10)
+
+    def update_estimate(self):
+        txt = "Choose a video to see a time estimate."
+        info = vinfo(self.app.video.get())
+        if info:
+            try:
+                h0 = float(self.h0.get() or 0)
+                end = min(info["seconds"], float(self.h1.get()) * 3600) if self.h1.get().strip() else info["seconds"]
+                step = float(self.step.get())
+                secs = max(end - h0 * 3600, 0)
+                t = est_survey(self.app, secs, step)
+                txt = (f"Estimated time incl. analysis: {fmt_dur(t)} for {secs / 3600:.1f} h of video "
+                       f"({t / max(secs, 1):.2f}x the video length)  {estimate_note(self.app)}")
+            except (ValueError, ZeroDivisionError):
+                txt = "Estimated time: hours and step must be numbers."
+        if self.est_lbl.cget("text") != txt:
+            self.est_lbl.config(text=txt)
+        self.after(1500, self.update_estimate)
 
     def run(self):
         a = self.app
@@ -819,6 +1058,8 @@ class ExperimentTab(ttk.Frame):
         ttk.Button(b, text="2  Track trial windows", command=self.track_trials).pack(side="left", padx=6)
         ttk.Button(b, text="3  Make results", command=self.results).pack(side="left")
         ttk.Label(b, text="Tracking uses the settings of the Track ants tab (overlay and trace video off).", foreground="#555").pack(side="left", padx=12)
+        self.est_lbl = ttk.Label(f, text="Time estimate for tracking the trial windows: press '1  Check log' first.", foreground="#555")
+        self.est_lbl.pack(anchor="w")
         ttk.Label(self, justify="left", foreground="#333", text=(
             "Steps: 1) Check log lists every trial (tap, which feeder opened, close) and where it falls in the video - check the times.\n"
             "2) Track trial windows tracks each trial window (tap - 5 min to close + 5 min); finished trials are skipped, so it can be\n"
@@ -871,25 +1112,19 @@ class ExperimentTab(ttk.Frame):
             except Exception:
                 self.trials = []
                 return messagebox.showerror("Experiment", "The log could not be read - see the messages below.")
+            self.show_estimate()
             if then:
                 then()
         self.app.runner.run([["experiment-results", "--", *args, "--check", "--json", rel(js)]], "Reading the Raspberry Pi log", on_done=done)
 
-    def track_trials(self):
-        self.check(then=self._queue_tracking)
-
-    def _queue_tracking(self):
+    def trial_steps(self) -> tuple[list[list[str]], int, int] | None:
+        """Tracking steps for the trials not yet tracked: (steps, already done, outside the video)."""
         a, tt = self.app, self.app.track
         v, ck, zd = a.video.get(), a.ckpt.get(), Path(a.zones_dir.get() or DEFAULT_ZONES)
-        miss = zones_complete(zd)
-        if miss:
-            return messagebox.showerror("Experiment", f"Zones folder is missing: {', '.join(miss)}.")
-        if not Path(ck).exists():
-            return messagebox.showerror("Experiment", "Model checkpoint not found (Track ants tab).")
         extra = tt.setting_args()
         if extra is None:
-            return
-        info = video_details(v)
+            return None
+        info = vinfo(v)
         length = info["seconds"] if info else float("inf")
         before, after = float(self.before.get()) * 60, float(self.after_.get()) * 60
         stem = Path(v).stem[:20].replace(" ", "_")
@@ -911,6 +1146,37 @@ class ExperimentTab(ttk.Frame):
                           "--mask", rel(zd / "tray_mask.png"), "--zones", rel(zd / "nest_clearance.json"),
                           "--areas", rel(zd / "areas.json"), "--tracking-zones", rel(zd / "tracking_zones.json"),
                           "--start-seconds", f"{s0:.1f}", "--duration-seconds", f"{s1 - s0:.1f}", "--device", a.device.get(), *extra])
+        return steps, skipped, outside
+
+    def show_estimate(self):
+        try:
+            res = self.trial_steps()
+        except (ValueError, KeyError):
+            res = None
+        if not res:
+            return
+        steps, skipped, outside = res
+        mins = sum(float(_arg(st, "--duration-seconds", 0)) for st in steps) / 60
+        est = sum(estimate_step(self.app, st) or 0 for st in steps)
+        self.est_lbl.config(text=f"{len(self.trials)} trials in the log: {len(steps)} windows to track ({mins:.0f} min of video), "
+                                 f"{skipped} already tracked, {outside} outside this video. Estimated time: {fmt_dur(est)} "
+                                 f"{estimate_note(self.app)}. Make results: under a minute.")
+
+    def track_trials(self):
+        self.check(then=self._queue_tracking)
+
+    def _queue_tracking(self):
+        a = self.app
+        zd = Path(a.zones_dir.get() or DEFAULT_ZONES)
+        miss = zones_complete(zd)
+        if miss:
+            return messagebox.showerror("Experiment", f"Zones folder is missing: {', '.join(miss)}.")
+        if not Path(a.ckpt.get()).exists():
+            return messagebox.showerror("Experiment", "Model checkpoint not found (Track ants tab).")
+        res = self.trial_steps()
+        if res is None:
+            return
+        steps, skipped, outside = res
         msg = f"{len(steps)} trial windows to track"
         if skipped:
             msg += f", {skipped} already done"
@@ -918,9 +1184,10 @@ class ExperimentTab(ttk.Frame):
             msg += f", {outside} outside this video"
         if not steps:
             return messagebox.showinfo("Experiment", msg + ". Nothing to do - go on with 'Make results'.")
-        mins = sum(float(st[st.index("--duration-seconds") + 1]) for st in steps) / 60
+        mins = sum(float(_arg(st, "--duration-seconds", 0)) for st in steps) / 60
+        est = sum(estimate_step(a, st) or 0 for st in steps)
         if not messagebox.askyesno("Track trial windows", f"{msg} ({mins:.0f} min of video in total).\n\n"
-                                   "On the lab PC this takes roughly 2-2.5x that time at 'Track at' = half the frame rate. Start?"):
+                                   f"Estimated time: {fmt_dur(est)} {estimate_note(a)}. Start?"):
             return
         a.runner.run(steps, f"Tracking {len(steps)} trial windows", on_done=lambda: messagebox.showinfo(
             "Experiment", "Trial windows tracked. Next: 3  Make results."))
