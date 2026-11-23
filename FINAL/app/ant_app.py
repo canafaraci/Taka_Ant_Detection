@@ -746,6 +746,205 @@ class SurveyTab(ttk.Frame):
                      on_done=lambda: a.show_results(out))
 
 
+# ------------------------------------------------------------------ Experiment tab
+
+def video_start_text(video: str) -> str:
+    m = re.search(r"(\d{4})[-_.](\d{2})[-_.](\d{2})[ T_]+(\d{2})[-_.:](\d{2})[-_.:](\d{2})", Path(video).stem)
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)}" if m else ""
+
+
+def runs_for_video(video: str, kind: str) -> list[Path]:
+    """Finished tracking ('track') or analysed survey ('survey') runs made from this video (matched by file name)."""
+    name, out = Path(video).name, []
+    for d in sorted(RUNS.glob("*")):
+        man = d / ("track_manifest.json" if kind == "track" else "survey_manifest.json")
+        done = d / ("counts.csv" if kind == "track" else "analysis/per_frame.csv")
+        if not (man.exists() and done.exists()):
+            continue
+        try:
+            if Path(json.loads(man.read_text()).get("video", "")).name == name:
+                out.append(d)
+        except Exception:
+            pass
+    return out
+
+
+class ExperimentTab(ttk.Frame):
+    """Feeder-choice experiment: read the Raspberry Pi log, track around each trial, make the results."""
+
+    def __init__(self, master, app: "App"):
+        super().__init__(master)
+        self.app = app
+        s = app.settings.get("experiment", {})
+        f = ttk.Frame(self)
+        f.pack(fill="x", padx=10, pady=10)
+        PathField(f, "Video", app.video, filetypes=[("Videos", "*.mp4 *.avi *.mov *.mkv"), ("All", "*.*")]).pack(fill="x", pady=2)
+        PathField(f, "Zones folder", app.zones_dir, kind="dir").pack(fill="x", pady=2)
+        self.log_path = tk.StringVar(value=s.get("log", ""))
+        PathField(f, "Pi feeder log", self.log_path, filetypes=[("Logs", "*.txt *.csv *.log"), ("All", "*.*")]).pack(fill="x", pady=2)
+        self.start = tk.StringVar(value=video_start_text(app.video.get()))
+        self.offset = tk.StringVar(value=s.get("offset", "0"))
+        self.fmap = tk.StringVar(value=s.get("fmap", ""))
+        self.chance = tk.StringVar(value=s.get("chance", "80"))
+        self.before = tk.StringVar(value=s.get("before", "5"))
+        self.after_ = tk.StringVar(value=s.get("after", "5"))
+        g = ttk.LabelFrame(f, text="Matching the log to the video (hover a name for an explanation)")
+        g.pack(fill="x", pady=(10, 0))
+        rows = [
+            ("Video started at (camera clock)", self.start, 22,
+             "Date and time of the first video frame, YYYY-MM-DD HH:MM:SS. Filled in from the file name (e.g. 2026-11-07_02-20-04.mp4); "
+             "change it if the name has no time or is wrong."),
+            ("Pi clock ahead of camera by (s)", self.offset, 8,
+             "If the Raspberry Pi's clock runs ahead of the recording computer's clock, enter the difference in seconds (behind = negative). "
+             "Best: keep both clocks synced (NTP) and leave 0. Check: in the trace video the cup should open at the logged time."),
+            ("Pi feeder names", self.fmap, 22,
+             "Which name in the log is which cup, e.g. '1=left, 2=right' or 'A=right, B=left'. Leave empty if the log says left/right, "
+             "or uses 1/2, A/B, L/R with 1, A, L = left."),
+            ("Chance LEFT opens (%)", self.chance, 22,
+             "The programmed chance that the LEFT feeder is the one that opens. One number for the whole recording (80), or per trial "
+             "range when it changes: '1-10:80, 11-20:20' (trials are numbered in the order of the log; see 'Check log')."),
+            ("Track from tap minus (min)", self.before, 8,
+             "'Track trial windows' tracks each trial from this long before the tap ..."),
+            ("... to close plus (min)", self.after_, 8, "... to this long after the feeder closes."),
+        ]
+        for i, (lab, var, w, tip) in enumerate(rows):
+            r, c = i // 2, (i % 2) * 2
+            l_ = ttk.Label(g, text=lab)
+            l_.grid(row=r, column=c, sticky="w", padx=(8, 4), pady=2)
+            ttk.Entry(g, textvariable=var, width=w).grid(row=r, column=c + 1, sticky="w", padx=(0, 20), pady=2)
+            Tooltip(l_, tip)
+        b = ttk.Frame(f)
+        b.pack(fill="x", pady=10)
+        ttk.Button(b, text="1  Check log", command=self.check).pack(side="left")
+        ttk.Button(b, text="2  Track trial windows", command=self.track_trials).pack(side="left", padx=6)
+        ttk.Button(b, text="3  Make results", command=self.results).pack(side="left")
+        ttk.Label(b, text="Tracking uses the settings of the Track ants tab (overlay and trace video off).", foreground="#555").pack(side="left", padx=12)
+        ttk.Label(self, justify="left", foreground="#333", text=(
+            "Steps: 1) Check log lists every trial (tap, which feeder opened, close) and where it falls in the video - check the times.\n"
+            "2) Track trial windows tracks each trial window (tap - 5 min to close + 5 min); finished trials are skipped, so it can be\n"
+            "   stopped and restarted. A survey of the same video can be used too (for ants near the cups between trials).\n"
+            "3) Make results merges the log with all tracking and survey runs of this video and writes FINAL/runs/experiment_<video>:\n"
+            "   trials.csv (one row per trial), trial_windows.csv, conditions.csv (per chance setting), peri_opening.csv, plots, report.txt.\n"
+            "Key numbers: share of ants at the left feeder between tap and opening (anticipation), share at the opened feeder while\n"
+            "open, entries into the opened cup, first entry after opening, and (with 2+ chance settings) the matching-law fit.")).pack(anchor="w", padx=10)
+        app.video.trace_add("write", lambda *_: self.start.set(video_start_text(app.video.get()) or self.start.get()))
+        self.trials: list[dict] = []
+
+    def save(self):
+        self.app.settings["experiment"] = dict(log=self.log_path.get(), offset=self.offset.get(), fmap=self.fmap.get(),
+                                               chance=self.chance.get(), before=self.before.get(), after=self.after_.get())
+        self.app.save()
+
+    def common(self) -> list[str] | None:
+        v, lg = self.app.video.get(), self.log_path.get()
+        if not Path(lg).exists():
+            messagebox.showerror("Experiment", "Choose the Raspberry Pi log file.")
+            return None
+        if not Path(v).exists():
+            messagebox.showerror("Experiment", "Choose the video.")
+            return None
+        try:
+            float(self.offset.get() or 0); float(self.before.get()); float(self.after_.get())
+        except ValueError:
+            messagebox.showerror("Experiment", "Clock offset and track minutes must be numbers.")
+            return None
+        if not self.start.get().strip():
+            messagebox.showerror("Experiment", "Enter when the video started (YYYY-MM-DD HH:MM:SS).")
+            return None
+        self.save()
+        args = ["--log", rel(lg), "--video", rel(v), "--video-start", self.start.get().strip(),
+                "--clock-offset", self.offset.get() or "0", "--chance-left", self.chance.get().strip()]
+        if self.fmap.get().strip():
+            args += ["--feeder-map", self.fmap.get().strip()]
+        return args
+
+    def check(self, then=None):
+        args = self.common()
+        if args is None:
+            return
+        js = RUNS / "_experiment_trials.json"
+        RUNS.mkdir(parents=True, exist_ok=True)
+
+        def done():
+            try:
+                self.trials = json.loads(js.read_text())
+            except Exception:
+                self.trials = []
+                return messagebox.showerror("Experiment", "The log could not be read - see the messages below.")
+            if then:
+                then()
+        self.app.runner.run([["experiment-results", "--", *args, "--check", "--json", rel(js)]], "Reading the Raspberry Pi log", on_done=done)
+
+    def track_trials(self):
+        self.check(then=self._queue_tracking)
+
+    def _queue_tracking(self):
+        a, tt = self.app, self.app.track
+        v, ck, zd = a.video.get(), a.ckpt.get(), Path(a.zones_dir.get() or DEFAULT_ZONES)
+        miss = zones_complete(zd)
+        if miss:
+            return messagebox.showerror("Experiment", f"Zones folder is missing: {', '.join(miss)}.")
+        if not Path(ck).exists():
+            return messagebox.showerror("Experiment", "Model checkpoint not found (Track ants tab).")
+        extra = tt.setting_args()
+        if extra is None:
+            return
+        info = video_details(v)
+        length = info["seconds"] if info else float("inf")
+        before, after = float(self.before.get()) * 60, float(self.after_.get()) * 60
+        stem = Path(v).stem[:20].replace(" ", "_")
+        steps, skipped, outside = [], 0, 0
+        for t in self.trials:
+            if t.get("open_s") is None:
+                continue
+            s0 = (t["tap_s"] if t.get("tap_s") is not None else t["open_s"] - 60) - before
+            s1 = (t["close_s"] if t.get("close_s") is not None else t["open_s"] + 600) + after
+            if s1 <= 0 or s0 >= length:
+                outside += 1
+                continue
+            s0, s1 = max(0.0, s0), min(length, s1)
+            out = RUNS / f"exp_{stem}_trial{int(t['trial']):03d}"
+            if (out / "counts.csv").exists():
+                skipped += 1
+                continue
+            steps.append(["track-ants", "--", "--video", rel(v), "--checkpoint", rel(ck), "--output", rel(out),
+                          "--mask", rel(zd / "tray_mask.png"), "--zones", rel(zd / "nest_clearance.json"),
+                          "--areas", rel(zd / "areas.json"), "--tracking-zones", rel(zd / "tracking_zones.json"),
+                          "--start-seconds", f"{s0:.1f}", "--duration-seconds", f"{s1 - s0:.1f}", "--device", a.device.get(), *extra])
+        msg = f"{len(steps)} trial windows to track"
+        if skipped:
+            msg += f", {skipped} already done"
+        if outside:
+            msg += f", {outside} outside this video"
+        if not steps:
+            return messagebox.showinfo("Experiment", msg + ". Nothing to do - go on with 'Make results'.")
+        mins = sum(float(st[st.index("--duration-seconds") + 1]) for st in steps) / 60
+        if not messagebox.askyesno("Track trial windows", f"{msg} ({mins:.0f} min of video in total).\n\n"
+                                   "On the lab PC this takes roughly 2-2.5x that time at 'Track at' = half the frame rate. Start?"):
+            return
+        a.runner.run(steps, f"Tracking {len(steps)} trial windows", on_done=lambda: messagebox.showinfo(
+            "Experiment", "Trial windows tracked. Next: 3  Make results."))
+
+    def results(self):
+        args = self.common()
+        if args is None:
+            return
+        v = self.app.video.get()
+        tr, sv = runs_for_video(v, "track"), runs_for_video(v, "survey")
+        if not tr and not sv:
+            return messagebox.showerror("Experiment", "No finished tracking or analysed survey runs of this video yet.\n"
+                                                      "Use '2  Track trial windows' (or run a survey) first.")
+        out = RUNS / f"experiment_{Path(v).stem[:30].replace(' ', '_')}"
+        cmd = ["experiment-results", "--", *args, "--before-min", self.before.get(), "--after-min", self.after_.get(),
+               "--output", rel(out)]
+        if tr:
+            cmd += ["--runs", *[rel(p) for p in tr]]
+        if sv:
+            cmd += ["--survey", *[rel(p) for p in sv]]
+        self.app.runner.run([cmd], f"Experiment results ({len(tr)} tracking runs, {len(sv)} surveys) -> {out.name}",
+                            on_done=lambda: self.app.show_results(out))
+
+
 # ------------------------------------------------------------------ Results tab
 
 class ResultsTab(ttk.Frame):
@@ -777,11 +976,12 @@ class ResultsTab(ttk.Frame):
         self.refresh()
 
     def refresh(self):
-        self.runs = sorted([p for p in RUNS.glob("*") if p.is_dir() and ((p / "tracks.csv").exists() or (p / "survey_manifest.json").exists())],
+        self.runs = sorted([p for p in RUNS.glob("*") if p.is_dir() and ((p / "tracks.csv").exists() or (p / "survey_manifest.json").exists()
+                                                                     or (p / "experiment_summary.json").exists())],
                            key=lambda p: p.stat().st_mtime, reverse=True)
         self.lb.delete(0, "end")
         for p in self.runs:
-            kind = "track " if (p / "tracks.csv").exists() else "survey"
+            kind = "track " if (p / "tracks.csv").exists() else ("EXPERIMENT" if (p / "experiment_summary.json").exists() else "survey")
             self.lb.insert("end", f"{kind}  {p.name}")
 
     def show(self, path: Path):
@@ -811,6 +1011,8 @@ class ResultsTab(ttk.Frame):
         self.button("Open folder", lambda: open_path(p))
         if (p / "tracks.csv").exists():
             self.show_track(p)
+        elif (p / "experiment_summary.json").exists():
+            self.show_experiment(p)
         else:
             self.show_survey(p)
         self.draw_chart()
@@ -852,6 +1054,19 @@ class ResultsTab(ttk.Frame):
             [["trace-video", "--", "--run", rel(p), "--scale", "1.0"]], f"4K trace video for {p.name}", on_done=lambda: self.show(p)))
         if (p / "feeder_visits.csv").exists():
             self.button("Feeder visits table", lambda: open_path(p / "feeder_visits.csv"))
+
+    # -- experiment results
+    def show_experiment(self, p: Path):
+        txt = (p / "report.txt").read_text() if (p / "report.txt").exists() else ""
+        self.summary.insert("1.0", txt)
+        self.image_paths = [p / n for n in ("trial_shares.png", "peri_opening.png", "matching.png") if (p / n).exists()]
+        for ip in self.image_paths:
+            self.button(ip.stem.replace("_", " "), lambda ip=ip: self.show_image(ip))
+        for n in ("trials.csv", "conditions.csv"):
+            if (p / n).exists():
+                self.button(n, lambda n=n: open_path(p / n))
+        if self.image_paths:
+            self.after(50, lambda: self.show_image(self.image_paths[0]))
 
     # -- survey run
     def show_survey(self, p: Path):
@@ -940,8 +1155,9 @@ class App(tk.Tk):
         self.zones = ZonesTab(self.nb, self)
         self.track = TrackTab(self.nb, self)
         self.survey = SurveyTab(self.nb, self)
+        self.experiment = ExperimentTab(self.nb, self)
         self.results = ResultsTab(self.nb, self)
-        for tab, name in [(self.zones, "1  Zones"), (self.track, "2  Track ants"), (self.survey, "3  Whole-video survey"), (self.results, "4  Results")]:
+        for tab, name in [(self.zones, "1  Zones"), (self.track, "2  Track ants"), (self.survey, "3  Whole-video survey"), (self.experiment, "4  Experiment"), (self.results, "5  Results")]:
             self.nb.add(tab, text=name)
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", side="bottom")

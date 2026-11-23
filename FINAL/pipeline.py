@@ -28,6 +28,7 @@ TOOLS: dict[str, list[str]] = {
     "analyze-survey": ["-m", "roi_ant_tracker.analyze_survey"],
     "track-ants": ["-m", "roi_ant_tracker.track_ants"],
     "trace-video": ["-m", "roi_ant_tracker.trace_video"],
+    "experiment-results": ["-m", "roi_ant_tracker.experiment_results"],
     "app": [str(PIPELINE_ROOT / "app" / "ant_app.py")],
 }
 
