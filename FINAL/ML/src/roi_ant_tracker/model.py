@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -17,6 +19,24 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 
 ARCHITECTURES = ("mobilenet_v3_fpn", "resnet50_fpn_v2")
+
+# Per-computer choice written by FINAL/check_speed.py (not in git).
+SETTINGS_PATH = Path(__file__).resolve().parents[3] / "device_settings.json"
+
+
+def local_settings() -> dict[str, Any]:
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def default_batch(fallback: int = 8) -> int:
+    """Batch size measured for this computer by check_speed.py, else the fallback."""
+    try:
+        return max(1, int(local_settings().get("batch", fallback)))
+    except Exception:
+        return fallback
 
 
 def build_detector(
@@ -78,6 +98,9 @@ def mps_available() -> bool:
 def choose_device(requested: str = "auto") -> torch.device:
     """auto picks CUDA, then Apple-silicon GPU (MPS), then CPU."""
     if requested == "auto":
+        preferred = local_settings().get("device")
+        if preferred == "cpu":
+            return torch.device("cpu")
         if torch.cuda.is_available():
             return torch.device("cuda")
         if mps_available():

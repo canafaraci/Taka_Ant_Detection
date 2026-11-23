@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torchvision.ops import nms
 
-from .model import choose_device, load_detector
+from .model import choose_device, default_batch, load_detector
 
 FIELDS = ["frame", "t_sec", "x1", "y1", "x2", "y2", "cx", "cy", "score", "area"]
 
@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--score-threshold", type=float, default=0.5)
     p.add_argument("--tile", type=int, default=320)
     p.add_argument("--overlap", type=int, default=32)
-    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--batch", type=int, default=default_batch(), help="Tiles per detector call (default: measured by check_speed.py, else 8).")
     p.add_argument("--dark-gate", type=float, default=30.0)
     p.add_argument("--nms-iou", type=float, default=0.3)
     p.add_argument("--device", default="auto")

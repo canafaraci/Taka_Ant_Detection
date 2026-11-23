@@ -16,16 +16,23 @@ Can (Taka Lab) in 2026.
   See `FINAL/app/README.md`.
 
 ## Set up on Windows (lab computer)
-1. Install Git (`winget install Git.Git`) and clone:
+No administrator rights are needed; everything installs for the current user.
+
+1. Install Git (`winget install -e --id Git.Git --scope user`), close and reopen PowerShell, then clone:
    ```
+   cd $HOME
    git clone https://github.com/canafaraci/Taka_Ant_Detection.git
    cd Taka_Ant_Detection
    ```
-2. Run the setup (installs Python 3.12, ffmpeg, PyTorch - CUDA build if an NVIDIA GPU is present - the other
-   packages, and downloads the model):
+2. Run the setup. It installs Python 3.12 and ffmpeg, PyTorch (a CUDA build matched to the NVIDIA card,
+   with fallbacks for older cards such as the GTX 10xx series, or the CPU build), the other packages,
+   downloads the model, and finally runs a speed test:
    ```
    powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1
    ```
+   The speed test (`FINAL\check_speed.py`) compares GPU and CPU and writes the faster one, with a batch size
+   that fits in GPU memory, to `FINAL\device_settings.json`. Survey and tracking use it automatically.
+   Re-run it after changing hardware or drivers: `.venv\Scripts\python.exe FINAL\check_speed.py`.
 3. Double-click **Ant Tracker.bat**.
 
 To update later: `git pull` in the folder (re-run the setup only if it says packages changed).

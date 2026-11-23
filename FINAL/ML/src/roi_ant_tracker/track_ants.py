@@ -54,7 +54,7 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torchvision.ops import nms
 
-from .model import choose_device, load_detector
+from .model import choose_device, default_batch, load_detector
 from .survey import (area_of, detect_frame, frames_ffmpeg, frames_opencv, in_zone, load_areas, load_zones, probe,
                      tile_origins, tile_touches_area)
 
@@ -82,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tile", type=int, default=320)
     p.add_argument("--overlap", type=int, default=32)
     p.add_argument("--dark-gate", type=float, default=30.0)
-    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--batch", type=int, default=default_batch(), help="Tiles per detector call (default: measured by check_speed.py, else 8).")
     p.add_argument("--nms-iou", type=float, default=0.3)
     p.add_argument("--max-speed", type=float, default=250.0, help="px/s a visible ant may move (search radius per frame = this / fps).")
     p.add_argument("--merge-radius", type=float, default=25.0, help="An unmatched ID this close to another ID's detection is merged with it.")

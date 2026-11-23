@@ -9,3 +9,4 @@ __pycache__/
 FINAL/runs/*
 !FINAL/runs/zones/
 FINAL/checkpoints/ours_*.pt
+FINAL/device_settings.json
