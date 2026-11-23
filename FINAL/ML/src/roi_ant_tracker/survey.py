@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -111,10 +112,10 @@ def probe(video: str) -> tuple[float, int, int, int]:
     return fps, n, w, h
 
 
-def detect_keyframe_interval(video: str, fps: float) -> int:
+def _keyframe_times_ffprobe(video: str) -> list[float]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        return 0
+        return []
     out = subprocess.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags",
          "-of", "csv=p=0", "-read_intervals", "%+120", video],
@@ -125,6 +126,32 @@ def detect_keyframe_interval(video: str, fps: float) -> int:
         parts = line.split(",")
         if len(parts) >= 2 and "K" in parts[1] and parts[0] not in ("", "N/A"):
             times.append(float(parts[0]))
+    return times
+
+
+def _keyframe_times_ffmpeg(video: str) -> list[float]:
+    """Same with ffmpeg alone: decode only keyframes of the first 120 s and read their times."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return []
+    err = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostdin", "-skip_frame", "nokey", "-t", "120", "-i", video,
+         "-map", "0:v:0", "-vf", "showinfo", "-f", "null", "-"],
+        capture_output=True, text=True,
+    ).stderr
+    return [float(m) for m in re.findall(r"pts_time:\s*([0-9.]+)", err)]
+
+
+def detect_keyframe_interval(video: str, fps: float) -> int:
+    times: list[float] = []
+    for finder in (_keyframe_times_ffprobe, _keyframe_times_ffmpeg):
+        try:
+            times = finder(video)
+        except OSError as e:          # e.g. Windows app control blocking ffprobe.exe
+            print(f"[survey] {finder.__name__.split('_')[-1]} could not run ({e}); trying the next way", flush=True)
+            times = []
+        if len(times) >= 3:
+            break
     times = sorted(times)[:6]
     if len(times) < 3:
         return 0
